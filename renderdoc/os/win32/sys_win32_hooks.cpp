@@ -324,6 +324,103 @@ private:
     return ret;
   }
 
+  // Optional filtering of which child processes are injected. This is controlled through
+  // environment variables so that it can be set per-launch rather than baked into the options:
+  //
+  //   RENDERDOC_CHILD_ONLY="Game.exe"           only matching children are injected
+  //   RENDERDOC_CHILD_SKIP="steamwebhelper.exe" matching children are never injected
+  //
+  // Entries are separated by ';', are matched case-insensitively against the full path, the file
+  // name and the raw command line, and may contain '*' or '?' wildcards. If both are set the skip
+  // list wins.
+  //
+  // Note that injection is recursive: only an injected process can see the processes it creates.
+  // RENDERDOC_CHILD_ONLY therefore has to include any intermediate launchers (e.g.
+  // "steam.exe;Game.exe") or the game itself will never be reached, while RENDERDOC_CHILD_SKIP
+  // leaves the launcher chain intact and is the safer of the two.
+  static rdcstr ChildFilterBasename(const rdcstr &path)
+  {
+    int32_t slash = path.find_last_of("/\\");
+    return (slash < 0) ? path : path.substr((size_t)slash + 1);
+  }
+
+  static bool ChildFilterGlob(const rdcstr &pattern, const rdcstr &text)
+  {
+    size_t p = 0;
+    size_t t = 0;
+    size_t star = ~0U;
+    size_t mark = 0;
+
+    while(t < text.size())
+    {
+      if(p < pattern.size() && (pattern[p] == '?' || pattern[p] == text[t]))
+      {
+        p++;
+        t++;
+      }
+      else if(p < pattern.size() && pattern[p] == '*')
+      {
+        star = p++;
+        mark = t;
+      }
+      else if(star != ~0U)
+      {
+        p = star + 1;
+        t = ++mark;
+      }
+      else
+      {
+        return false;
+      }
+    }
+
+    while(p < pattern.size() && pattern[p] == '*')
+      p++;
+
+    return p == pattern.size();
+  }
+
+  static bool ChildFilterMatches(const rdcstr &list, const rdcstr &candidate)
+  {
+    if(list.empty() || candidate.empty())
+      return false;
+
+    const rdcstr text = strlower(candidate);
+    const rdcstr base = ChildFilterBasename(text);
+
+    int32_t start = 0;
+    while(start <= (int32_t)list.size())
+    {
+      int32_t sep = list.find(';', start);
+
+      rdcstr item = (sep < 0) ? list.substr((size_t)start)
+                              : list.substr((size_t)start, (size_t)(sep - start));
+      item.trim();
+      item = strlower(item);
+
+      if(!item.empty() && (ChildFilterGlob(item, base) || ChildFilterGlob(item, text)))
+        return true;
+
+      if(sep < 0)
+        break;
+
+      start = sep + 1;
+    }
+
+    return false;
+  }
+
+  static rdcstr ChildFilterEnv(const char *name)
+  {
+    char buf[1024] = {};
+    DWORD len = GetEnvironmentVariableA(name, buf, (DWORD)sizeof(buf));
+
+    if(len == 0 || len >= (DWORD)sizeof(buf))
+      return rdcstr();
+
+    return rdcstr(buf);
+  }
+
   static bool ShouldInject(LPCWSTR lpApplicationName, LPCWSTR lpCommandLine)
   {
     if(!RenderDoc::Inst().GetCaptureOptions().hookIntoChildren)
@@ -349,6 +446,38 @@ private:
       if(cmd.contains("renderdoccmd.exe") || cmd.contains("qrenderdoc.exe"))
       {
         inject = false;
+      }
+    }
+
+    // apply the optional child filters described above. They are only consulted for processes we
+    // would otherwise inject into, so they can never turn a 'no' into a 'yes'.
+    if(inject)
+    {
+      const rdcstr only = ChildFilterEnv("RENDERDOC_CHILD_ONLY");
+      const rdcstr skip = ChildFilterEnv("RENDERDOC_CHILD_SKIP");
+
+      if(!only.empty() || !skip.empty())
+      {
+        rdcstr app;
+        rdcstr cmd;
+
+        if(lpApplicationName)
+          app = StringFormat::Wide2UTF8(lpApplicationName);
+        if(lpCommandLine)
+          cmd = StringFormat::Wide2UTF8(lpCommandLine);
+
+        if(!skip.empty() && (ChildFilterMatches(skip, app) || ChildFilterMatches(skip, cmd)))
+        {
+          RDCLOG("Child filter: not injecting '%s' (matches RENDERDOC_CHILD_SKIP)", app.c_str());
+          inject = false;
+        }
+        else if(!only.empty() && !ChildFilterMatches(only, app) &&
+                !ChildFilterMatches(only, cmd))
+        {
+          RDCLOG("Child filter: not injecting '%s' (does not match RENDERDOC_CHILD_ONLY)",
+                 app.c_str());
+          inject = false;
+        }
       }
     }
 
