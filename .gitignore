@@ -48,3 +48,10 @@ qrenderdoc/3rdparty/pyside
 .DS_Store
 plugins-*/
 __pycache__
+
+# one-click Windows x64 build cache and generated packages
+/deps/
+/RenderDoc_*.msi
+/RenderDoc_*.zip
+/RenderDoc_*.sha256
+/RenderDoc_*.wixpdb
